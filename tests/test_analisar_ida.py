@@ -31,6 +31,17 @@ assert S["funcoes"] == 9
 assert S["funcoes_por_tipo"]["lib"] == 1 and S["funcoes_por_tipo"]["thunk"] == 1
 assert S["funcoes_por_tipo"]["runtime"] == 2
 assert S["falhas_decompilador"] == 1 and S["decompiladas"] == 4, (S["decompiladas"], S["falhas_decompilador"])
+assert S["recuperadas_retry"] == 1, S["recuperadas_retry"]          # pong volta apos reanalisar
+assert S["falhas_por_categoria"] == {"chamada": 1}, S["falhas_por_categoria"]
+fp = open(os.path.join(out, "falhas_priorizadas.csv"), encoding="utf-8-sig").read()
+print(fp)
+assert "Foo_Calc_int" in fp and "chamada" in fp
+c = open(os.path.join(out, "projeto", "src", "Foo_Calc_int.c"), encoding="utf-8").read()
+print(c)
+assert "Exemplos de chamada" in c and "MOD_mp_TOP_:" in c and "double 273.15" in c and "bloco 0x" in c and "-> MOD_mp_LEAF_" in c
+assert "recuperada no retry" in open(os.path.join(out, "projeto", "src", "pong.c"), encoding="utf-8").read()
+assert not os.path.exists(os.path.join(out, "asm", "pong.asm"))
+assert os.path.exists(os.path.join(out, "falhas_resumo.txt"))
 ordem = open(os.path.join(out, "ordem_reescrita.csv"), encoding="utf-8-sig").read().splitlines()
 print("\n".join(ordem))
 assert os.path.exists(os.path.join(out, "projeto", "src", "MOD_mp_LEAF.c"))

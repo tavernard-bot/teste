@@ -218,6 +218,45 @@ def alcancaveis(grafo, raizes):
     return visto
 
 
+def dependentes(callers, ea):
+    """Funcoes que dependem (direta ou transitivamente) de `ea`. callers: {funcao: set(chamadores)}."""
+    return alcancaveis(callers, [ea]) - {ea}
+
+
+# Categorias de falha do Hex-Rays (por palavras da mensagem) + o que tentar. Heuristico.
+CATEGORIAS_FALHA = [
+    ("prazo", r"^prazo", "Nao foi decompilada por falta de tempo: rode de novo com --timeout maior (--only NOME)."),
+    ("sp", r"positive sp|sp value|sp-analysis|stack pointer",
+     "Pilha desbalanceada, em geral por chamada noreturn ou convencao/purge errados num callee. No IDA: corrigir o "
+     "prototipo do callee (cdecl/stdcall), marcar noreturn ou ajustar o SP; senao reescrever do asm anotado."),
+    ("chamada", r"call analysis",
+     "Argumentos de uma chamada nao determinados: defina o prototipo do callee (tecla Y) ou use __usercall/__spoils; "
+     "os 'Exemplos de chamada' no .c ajudam a inferir os argumentos."),
+    ("tamanho", r"too big|function is too|stack frame is too|huge",
+     "Funcao/frame grande demais: aumentar o limite (MAX_FUNCSIZE em IDA\\cfg\\hexrays.cfg - confira o nome na sua versao) "
+     "ou reescrever por blocos a partir do asm."),
+    ("blocos", r"bad block|basic block|ranges|wrong|indirect jump|switch",
+     "Fluxo de controle problematico (tabela de salto/switch nao resolvida, chunks, tail call): reanalisar a funcao, "
+     "corrigir limites e o switch no IDA; ou reescrever do asm (blocos com preds/succs ja listados)."),
+    ("prologo", r"prolog", "Prologo nao reconhecido: ajustar o inicio/frame da funcao no IDA; ou asm."),
+    ("instrucao", r"illegal|insn|instruction|not supported|unsupported|unknown",
+     "Instrucao sem suporte (comum com AVX-512/x87 exoticas): reescrever do asm anotado (constantes e chamadas ja resolvidas)."),
+    ("sobreposicao", r"overlap", "Variaveis de pilha sobrepostas: reescrever do asm ou corrigir o frame."),
+    ("memoria", r"memory", "Falta de memoria no IDA: rode isoladamente (--only NOME --jobs 1)."),
+    ("licenca", r"licen", "Problema de licenca do Hex-Rays para esta arquitetura."),
+    ("interno", r"internal", "Erro interno do Hex-Rays: reanalisar; se persistir, reescrever do asm."),
+    ("nulo", r"retornou None", "decompile() devolveu None: tratar como falha; reescrever do asm."),
+]
+
+
+def categoria_falha(motivo, categoria=None):
+    """-> (categoria, sugestao). Com `categoria`, so devolve a sugestao dela."""
+    for cat, rx, sug in CATEGORIAS_FALHA:
+        if (categoria and cat == categoria) or (not categoria and re.search(rx, motivo or "", re.I)):
+            return cat, sug
+    return "outro", "Motivo nao classificado: ver a mensagem; reescrever do asm anotado."
+
+
 # ---------------------------------------------------------------------------
 # Tabelas numericas candidatas (coeficientes termodinamicos etc.)
 # ---------------------------------------------------------------------------

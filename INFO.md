@@ -70,6 +70,8 @@ primeiro. DLLs que importam outra da pasta devem ser linkadas contra a **versão
 | `functions.json` | índice completo por função | chaves abaixo (3.2); filtre por `kind`, `exported`, `falha` |
 | `exports_prototypes.json` | **interface pública**: protótipo, convenção, arquivo `.c` de cada export | seção 3.3 |
 | `callgraph.json` / `callgraph_edges.csv` | quem chama quem (`chamador;ea_chamador;chamado;ea_chamado`) | use p/ priorizar e achar dependências |
+| `falhas_priorizadas.csv` | **fila das funções sem pseudocódigo**, já ordenada por impacto (seção 4.1) | `prioridade;ea;nome;tipo;tamanho;blocos;categoria;exportada;chamadores_diretos;dependentes;exports_afetados;motivo;sugestao;arquivo` |
+| `falhas_resumo.txt` | histograma das falhas por categoria + o que tentar | curto: leia antes de decidir a estratégia |
 | `decompile_failures.csv` | funções que o Hex-Rays não decompilou | `ea;nome;tipo;tamanho;blocos;motivo`; o `.c` correspondente contém o disassembly (exceto motivo "prazo": essas não têm `.c`; pedir novo run) |
 | `funcoes_biblioteca.txt` | o que **não** reescrever (FLIRT, thunks, runtime) | só consulte por grep |
 | `renomeacoes.csv` | `ea;nome_original;nome_c` | traduz nome mangled/C++ ↔ nome C usado nos `.c` |
@@ -168,13 +170,51 @@ Isso dispensa procurar xrefs: a dependência de dados e de chamadas está ali.
 5. `build.bat check` -> a função deve compilar isolada.
 6. Teste diferencial dessa função (seção 7). Só avance quando passar.
 
-**Passo 2 - funções que falharam** (`decompile_failures.csv`): o `.c` traz o disassembly. Priorize por
-**quantidade de chamadores** (`callgraph.json`) e por serem exportadas. Funções pequenas (`tamanho`/`blocos`
-baixos) costumam ser rápidas de reescrever a partir do asm; grandes, deixe para o fim ou compare com a
-saída do teste para deduzir o algoritmo.
+**Passo 2 - funções que falharam**: ver a seção 4.1 (é comum haver muitas; o pipeline já as prioriza).
 
 **Passo 3 - liga e valida a DLL**: `build.bat` (usa o mesmo `.def`). `LNK2001` num export = função ainda
 não implementada/nome diferente. Depois, teste diferencial completo e `comparar_dlls.py` (seção 9).
+
+---
+
+### 4.1 Funções sem pseudocódigo (Hex-Rays falhou)
+
+É normal falhar em parte das funções (x87/AVX exóticas, SP desbalanceado, chamadas não resolvidas, switch
+sem tabela, funções muito grandes). O pipeline **já tentou de novo** (reanalisou a função e decompilou outra vez)
+e deixou para você só o que continuou falhando. **Não leia `decompile_failures.csv` de ponta a ponta**:
+
+1. Leia `D\falhas_resumo.txt`: quantas falhas por categoria e o que tentar em cada uma.
+2. Trabalhe `D\falhas_priorizadas.csv` de cima para baixo. A ordem é: exportadas primeiro; depois mais
+   `exports_afetados` e `dependentes`; empate -> menores primeiro (ganho rápido). Uma falha numa função folha
+   usada por muitos exports bloqueia mais trabalho que uma falha numa função isolada.
+3. O `.c` da função falha já traz **tudo para reescrever sem abrir mais nada**:
+   motivo, categoria, sugestão, impacto, **exemplos de chamada** (linhas dos chamadores decompilados que
+   chamam esta função - mostram nº e tipo dos argumentos) e **disassembly anotado**.
+4. Como ler o asm anotado: blocos básicos com `preds/succs` (o grafo de fluxo está explícito);
+   `-> nome [kind]` = chamada resolvida; `-> DLL!api` = import; `[SIMBOLO] = double 273.15` = constante
+   lida da memória (ponto flutuante já decodificado); `str '...'` = literal. Reescreva bloco a bloco: um
+   `if/for/while` por aresta de salto, variáveis = registros/pilha por bloco.
+5. O protótipo de uma função falha vem de `proto` (pode estar vazio): infira pelos **Exemplos de chamada** e pelos
+   registradores lidos no primeiro bloco (x64 Windows: RCX,RDX,R8,R9 / XMM0-3 inteiros/double; Fortran: tudo
+   ponteiro).
+6. Valide cada função falha reescrita com o teste diferencial **antes de seguir** - aqui o risco de erro é
+   maior que nas decompiladas.
+7. Funções `prazo` (puladas por tempo) **não têm `.c`**: peça um novo run para a DLL (`--only NOME --timeout` maior);
+   não reescreva do zero.
+
+| categoria | o que costuma ser | o que tentar |
+|---|---|---|
+| `sp` | pilha desbalanceada (callee noreturn/convenção errada) | asm anotado; se for crítica, corrigir o callee no IDA e re-rodar a DLL |
+| `chamada` | argumentos de uma chamada não resolvidos | exemplos de chamada + asm; pode ser reescrita direto |
+| `blocos` | switch/tabela de salto, chunks | asm anotado (blocos já separados) |
+| `instrucao` | instrução sem suporte (AVX-512/x87) | asm anotado; constantes já resolvidas |
+| `tamanho` | função/frame enorme | aumentar o limite no `hexrays.cfg` do IDA e re-rodar, ou reescrever por blocos |
+| `prazo` / `memoria` | recurso | novo run isolado |
+| `outro` | não classificado | ler o motivo no CSV |
+
+Se **muitas** funções importantes caírem na mesma categoria (ex.: dezenas de `sp` ou `chamada`), vale mais
+corrigir a causa uma vez no IDA (prototipo/noreturn do callee comum, limite do `hexrays.cfg`) e **re-rodar só essa
+DLL** (`--only NOME --force`, lembrando da regra 6: trabalhe numa cópia) do que reescrever tudo do asm.
 
 ---
 

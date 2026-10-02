@@ -111,8 +111,13 @@ O que cada item da lista virou
      xrefs, funcoes que usam), .bin cru de cada segmento, constantes float/double,
      TABELAS CANDIDATAS de doubles (heuristica) e tabelas.c/globais.c com os valores
      iniciais em C (17 digitos significativos).
-  6  decompile_failures.txt/.csv (ea, nome, tipo, tamanho, blocos, motivo+endereco);
-     o .c da funcao que falhou traz o disassembly e ha asm\<funcao>.asm.
+  6  Falhas do decompilador: o IDA reanalisa a funcao e tenta de novo (retry); o que continua
+     falhando vai para falhas_priorizadas.csv (ordenada por impacto: exportada, exports
+     afetados, dependentes, tamanho), falhas_resumo.txt (histograma por categoria + o que
+     tentar) e decompile_failures.csv. O .c da funcao traz motivo, categoria, sugestao,
+     impacto, EXEMPLOS DE CHAMADA (linhas dos chamadores que mostram os argumentos) e
+     DISASSEMBLY ANOTADO (blocos com preds/succs, chamadas/imports resolvidos, strings e
+     constantes double/float decodificadas); tambem em asm\<funcao>.asm.
   7  disasm_completo.asm (idc.gen_file OFILE_ASM).
   8  RTTI MSVC (COL, hierarquia de bases) e vtables Itanium/MSVC -> classes_rtti.json
      e classes_skeleton.hpp.

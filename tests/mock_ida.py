@@ -60,7 +60,7 @@ def _init():
     _func(TEXT + 0x280, "pong", 3)
     _func(TEXT + 0x300, "__security_check_cookie", 2)
     _func(TEXT + 0x400, "memcpy", 2, flags=FL_LIB)
-    _func(TEXT + 0x500, "?Calc@Foo@@QEAAHH@Z", 4)
+    _func(TEXT + 0x500, "?Calc@Foo@@QEAAHH@Z", 4, mnems=["movsd", "call", "mov", "ret"])
     _func(TEXT + 0x600, "_DllMainCRTStartup", 3)
     _func(TEXT + 0x700, "j_thunk", 1, flags=FL_THUNK)
     # xrefs
@@ -72,6 +72,9 @@ def _init():
     _xref(TEXT + 0x10C, RDATA + 0xA0, DR_O)          # string
     _xref(TEXT + 0x200, TEXT + 0x280, FL_CN)         # ping <-> pong (ciclo)
     _xref(TEXT + 0x280, TEXT + 0x200, FL_CN)
+    _xref(TEXT + 0x500, RDATA + 0x80, DR_R)          # Calc le T0 (double 273.15)
+    _xref(TEXT + 0x504, TEXT + 0x000, FL_CN)         # Calc -> LEAF
+    _xref(TEXT + 0x110, TEXT + 0x500, FL_CN)         # TOP -> Calc
     _xref(TEXT + 0x600, TEXT + 0x300, FL_CN)         # entry -> cookie
     _xref(TEXT + 0x604, TEXT + 0x500, FL_CN)         # entry -> metodo (DllMain)
 
@@ -134,7 +137,9 @@ class _CFunc:
 
     def __str__(self):
         n = NAMES[self.ea]
-        return f"__int64 __fastcall {n}(double *a1, int *a2)\n{{\n  return 0;\n}}"
+        chamadas = "".join(f"  {NAMES[t]}(a1, a2);\n" for it in FUNCS[self.ea]["items"]
+                           for t, tp in XR.get(it, []) if tp == FL_CN and t in NAMES)
+        return f"__int64 __fastcall {n}(double *a1, int *a2)\n{{\n{chamadas}  return 0;\n}}"
 
     def get_func_type(self, tif):
         tif._decl = f"__int64 __fastcall {NAMES[self.ea]}(double *a1, int *a2)"
@@ -172,9 +177,14 @@ class _Ftd:
         return types.SimpleNamespace(type=t, name=n)
 
 
+REANALISADAS = set()
+
+
 def decompile(ea):
     if ea == TEXT + 0x500:
         raise DecompilationFailure("call analysis failed")
+    if ea == TEXT + 0x280 and ea not in REANALISADAS:
+        raise DecompilationFailure("positive sp value has been found")
     return _CFunc(ea)
 
 
@@ -200,8 +210,9 @@ def install():
          get_entry_name=lambda o: [e for e in ents if e[0] == o][0][2],
          get_entry_forwarder=lambda o: "")
     _mod("ida_funcs", FUNC_LIB=FL_LIB, FUNC_THUNK=FL_THUNK, FUNC_NORET=FL_NORET,
-         get_func=_get_func, get_func_name=lambda ea: NAMES.get(ea, ""))
-    _mod("ida_gdl", FlowChart=lambda f: types.SimpleNamespace(size=3))
+         get_func=_get_func, get_func_name=lambda ea: NAMES.get(ea, ""),
+         reanalyze_function=lambda f: REANALISADAS.add(f.start_ea))
+    _mod("ida_gdl", FlowChart=_flowchart)
     _mod("ida_ida", inf_is_64bit=lambda: True, inf_get_start_ip=lambda: TEXT + 0x600,
          inf_get_cc_id=lambda: 1, inf_get_procname=lambda: "metapc")
     _mod("ida_lines", tag_remove=lambda s: s,
@@ -237,6 +248,31 @@ def install():
          get_type=lambda ea: None, guess_type=lambda ea: None, print_insn_mnem=lambda ea: _mnem(ea))
     _mod("ida_hexrays", init_hexrays_plugin=lambda: True, decompile=decompile,
          DecompilationFailure=DecompilationFailure)
+
+
+class _BB:
+    def __init__(self, a, b, preds, succs):
+        self.start_ea, self.end_ea, self._p, self._s = a, b, preds, succs
+
+    def preds(self):
+        return iter(self._p)
+
+    def succs(self):
+        return iter(self._s)
+
+
+class _FC(list):
+    size = 2
+
+
+def _flowchart(f):
+    meio = f.start_ea + 8 if f.end_ea - f.start_ea >= 12 else f.end_ea
+    b1 = _BB(f.start_ea, meio, [], [])
+    if meio == f.end_ea:
+        return _FC([b1])
+    b2 = _BB(meio, f.end_ea, [b1], [])
+    b1._s = [b2]
+    return _FC([b1, b2])
 
 
 def _mnem(ea):

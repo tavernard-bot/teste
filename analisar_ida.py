@@ -25,6 +25,7 @@ Saidas (tudo em IDA_OUTPUT):
 """
 import collections
 import os
+import re
 import sys
 import time
 import traceback
@@ -102,6 +103,8 @@ IMPORTS = {}      # ea do slot IAT -> (dll, nome, ordinal)
 EXPORTS = []      # lista de dicts
 ENTRY_EA = None   # ponto de entrada do PE (DllMain/CRT startup)
 ISA = collections.Counter()
+FALHAS = {}       # ea -> {motivo, arq, ...} (funcoes de usuario que o Hex-Rays nao decompilou)
+ORDEM_ARQ = []
 
 
 def prazo_estourado():
@@ -603,13 +606,88 @@ def cabecalho_funcao(ea):
     return "\n".join(L)
 
 
-def asm_da_funcao(ea):
+def _valor_item(alvo, mnem):
+    """Valor de uma constante lida de memoria (double/float/inteiro) para anotar o asm."""
+    try:
+        import struct
+        seg = ida_segment.getseg(alvo)
+        if seg is None or (seg.perm & ida_segment.SEGPERM_EXEC):
+            return ""
+        fl = ida_bytes.get_flags(alvo)
+        m = (mnem or "").lower()
+        if ida_bytes.is_double(fl) or m.endswith(("sd", "pd")):
+            raw = ida_bytes.get_bytes(alvo, 8)
+            return "= double " + repr(struct.unpack("<d", raw)[0]) if raw and len(raw) == 8 else ""
+        if ida_bytes.is_float(fl) or m.endswith(("ss", "ps")):
+            raw = ida_bytes.get_bytes(alvo, 4)
+            return "= float " + repr(struct.unpack("<f", raw)[0]) if raw and len(raw) == 4 else ""
+        if ida_bytes.is_qword(fl):
+            return "= qword 0x%X" % ida_bytes.get_qword(alvo)
+        if ida_bytes.is_dword(fl):
+            return "= dword 0x%X" % ida_bytes.get_dword(alvo)
+    except Exception:
+        pass
+    return ""
+
+
+def _comentarios_insn(h, ea_func, mnem):
+    cm = []
+    for x in idautils.XrefsFrom(h, 0):
+        alvo = x.to
+        if x.type in CODE_REFS:
+            if alvo in IMPORTS:
+                cm.append("-> %s!%s" % (IMPORTS[alvo][0], IMPORTS[alvo][1] or "#%d" % IMPORTS[alvo][2]))
+                continue
+            fn = ida_funcs.get_func(alvo)
+            if fn and fn.start_ea != ea_func:
+                nome = F[fn.start_ea]["name"] if fn.start_ea in F else ida_funcs.get_func_name(fn.start_ea)
+                kind = F[fn.start_ea]["kind"] if fn.start_ea in F else "?"
+                cm.append("-> %s [%s]" % (nome, kind))
+        elif x.type in DATA_REFS:
+            if alvo in IMPORTS:
+                cm.append("-> %s!%s" % (IMPORTS[alvo][0], IMPORTS[alvo][1]))
+            elif alvo in F:
+                cm.append("&%s" % F[alvo]["name"])
+            elif ida_bytes.is_strlit(ida_bytes.get_flags(alvo)):
+                cm.append("str %r" % _texto_string(alvo))
+            else:
+                nm = ida_name.get_name(alvo) or ("0x%X" % alvo)
+                cm.append(("[%s] %s" % (nm, _valor_item(alvo, mnem))).strip())
+    return cm
+
+
+def _blocos(ea):
+    fn = ida_funcs.get_func(ea)
+    try:
+        return sorted((b.start_ea, b.end_ea, [p.start_ea for p in b.preds()], [q.start_ea for q in b.succs()])
+                      for b in ida_gdl.FlowChart(fn))
+    except Exception:
+        return [(fn.start_ea, fn.end_ea, [], [])]
+
+
+def asm_anotado(ea):
+    """Disassembly por bloco basico, com preds/succs e comentarios: chamadas resolvidas,
+    imports, strings e constantes double/float lidas da memoria. Fallback quando o Hex-Rays falha."""
+    itens = list(idautils.FuncItems(ea))
     linhas = []
-    for h in idautils.FuncItems(ea):
-        try:
-            linhas.append(f"{h:016X}  {sem_tags(ida_lines.generate_disasm_line(h, 0))}")
-        except Exception:
-            linhas.append(f"{h:016X}  ; (falha ao desmontar)")
+    k = 0
+    for ini, fim, preds, succs in _blocos(ea):
+        linhas.append("; ---- bloco 0x%X  preds=[%s]  succs=[%s]" % (
+            ini, ",".join("0x%X" % p for p in preds), ",".join("0x%X" % q for q in succs)))
+        while k < len(itens) and itens[k] < ini:
+            k += 1
+        while k < len(itens) and itens[k] < fim:
+            h = itens[k]
+            k += 1
+            try:
+                txt = sem_tags(ida_lines.generate_disasm_line(h, 0))
+            except Exception:
+                txt = "; (falha ao desmontar)"
+            try:
+                cm = _comentarios_insn(h, ea, idc.print_insn_mnem(h))
+            except Exception:
+                cm = []
+            linhas.append("%016X  %-48s%s" % (h, txt, ("  ; " + " | ".join(cm)) if cm else ""))
     return "\n".join(linhas) + "\n"
 
 
@@ -642,13 +720,12 @@ def decompilar(ordem):
         os.makedirs(LIBDIR, exist_ok=True)
         alvos += [(ea, LIBDIR) for ea in sorted(F) if F[ea]["kind"] in ("lib", "runtime")]
     ok = bad = pulados = 0
-    falhas = []
     f_all = open(os.path.join(OUT, "pseudocode_hexrays.c"), "w", encoding="utf-8", errors="replace")
     f_fail = open(os.path.join(OUT, "decompile_failures.txt"), "w", encoding="utf-8", errors="replace")
     f_all.write("/* PSEUDOCODIGO HEX-RAYS - SOMENTE CODIGO DO USUARIO, folhas primeiro.\n"
                 "   Funcoes de biblioteca/thunks: ver funcoes_biblioteca.txt.\n"
                 "   NAO E O CODIGO FONTE ORIGINAL. */\n\n")
-    f_fail.write("# Falhas do decompilador: ea | nome | tipo | tamanho | motivo\n")
+    f_fail.write("# 1a passada (ANTES do retry): ea | nome | tipo | tamanho | motivo. Lista final: falhas_priorizadas.csv\n")
     ordem_arq = []
     try:
         for n, (ea, pasta) in enumerate(alvos):
@@ -658,7 +735,8 @@ def decompilar(ordem):
                 pulados += 1
                 i["falha"] = "prazo (IDA_SOFT_DEADLINE) esgotado antes de decompilar"
                 f_fail.write(f"0x{ea:016X} | {i['name']} | {i['kind']} | {i['size']} | {i['falha']}\n")
-                falhas.append(ea)
+                if pasta == SRC:
+                    FALHAS[ea] = {"motivo": i["falha"], "arq": arq}
                 continue
             i["nblocks"] = nblocks(ea)
             try:
@@ -678,24 +756,28 @@ def decompilar(ordem):
                     ordem_arq.append(arq)
                 ok += 1
             except Exception as e:
-                bad += 1
                 motivo = str(e) or type(e).__name__
                 errea = getattr(e, "errea", None)
                 if errea not in (None, BADADDR):
                     motivo += f" (em 0x{errea:X})"
                 i["falha"] = motivo
                 i["proto"] = i["proto"] or prototipo(ea)
-                asm = asm_da_funcao(ea)
+                try:
+                    asm = asm_anotado(ea)
+                except Exception:
+                    asm = asm_da_funcao_simples(ea)
                 write(arq + ".asm", asm, ASMDIR)
                 caminho = os.path.join(pasta, arq + ".c")
                 with open(caminho, "w", encoding="utf-8", errors="replace") as f:
                     f.write(cabecalho_funcao(ea) + "\n" + INCLUDES
-                            + f"\n/* FALHA NO DECOMPILADOR: {motivo}\n   Disassembly de apoio (tambem em asm\\{arq}.asm):\n"
+                            + f"\n/* FALHA NO DECOMPILADOR: {motivo}\n   Disassembly anotado (tambem em asm\\{arq}.asm):\n"
                             + asm.replace("*/", "* /") + "*/\n")
                 i["arquivo"] = os.path.relpath(caminho, OUT)
                 f_fail.write(f"0x{ea:016X} | {i['name']} | {i['kind']} | {i['size']} | {motivo}\n")
                 f_fail.flush()
-                falhas.append(ea)
+                if pasta == SRC:
+                    bad += 1
+                    FALHAS[ea] = {"motivo": motivo, "arq": arq}
             if n % 50 == 0:
                 f_all.flush()
     finally:
@@ -703,11 +785,132 @@ def decompilar(ordem):
         f_all.close()
         f_fail.write(f"\n# total falhas={bad} puladas_por_prazo={pulados}\n")
         f_fail.close()
-    ac.gravar_csv(os.path.join(OUT, "decompile_failures.csv"),
-                  ["ea", "nome", "tipo", "tamanho", "blocos", "motivo"],
-                  [[f"0x{e:X}", F[e]["name"], F[e]["kind"], F[e]["size"], F[e]["nblocks"], F[e]["falha"]] for e in falhas])
     write("src_ordem.txt", "\n".join(f"{k:05d} {a}.c" for k, a in enumerate(ordem_arq, 1)) + "\n", SRC)
+    ORDEM_ARQ[:] = ordem_arq
     STATUS.update({"decompiladas": ok, "falhas_decompilador": bad, "puladas_prazo": pulados})
+
+
+def asm_da_funcao_simples(ea):
+    linhas = []
+    for h in idautils.FuncItems(ea):
+        try:
+            linhas.append(f"{h:016X}  {sem_tags(ida_lines.generate_disasm_line(h, 0))}")
+        except Exception:
+            linhas.append(f"{h:016X}  ; (falha ao desmontar)")
+    return "\n".join(linhas) + "\n"
+
+
+def exemplos_de_chamada(ea, limite=6):
+    """Linhas dos chamadores (ja decompilados) que chamam a funcao: mostram nº/tipo de argumentos."""
+    nome = F[ea]["name"]
+    rx = re.compile(r"\b" + re.escape(nome) + r"\s*\(")
+    ex = []
+    for c in sorted(F[ea]["callers"]):
+        arq = F[c].get("arquivo")
+        if not arq or not F[c]["decompilado"]:
+            continue
+        try:
+            with open(os.path.join(OUT, arq), encoding="utf-8", errors="replace") as fh:
+                for ln in fh:
+                    t = ln.strip()
+                    if rx.search(t) and not t.startswith(("/*", "*", "//", "#")):
+                        ex.append(f"{F[c]['name']}: {t[:160]}")
+                        if len(ex) >= limite:
+                            return ex
+        except OSError:
+            continue
+    return ex
+
+
+def tratar_falhas():
+    """1) tenta recuperar (reanalisa a funcao e decompila de novo); 2) enriquece o que continua
+    falhando (categoria, sugestao, impacto, exemplos de chamada); 3) gera a lista priorizada."""
+    import ida_hexrays
+    if not FALHAS:
+        STATUS.update({"recuperadas_retry": 0, "falhas_por_categoria": {}})
+        return
+    recuperadas = []
+    if STATUS.get("hexrays"):
+        for ea in list(FALHAS):
+            if prazo_estourado():
+                break
+            if FALHAS[ea]["motivo"].startswith("prazo"):
+                continue
+            try:
+                ida_funcs.reanalyze_function(ida_funcs.get_func(ea))
+                ida_auto.auto_wait()
+                cf = ida_hexrays.decompile(ea)
+                if cf is None:
+                    continue
+                corpo = sem_tags(str(cf))
+            except Exception:
+                continue
+            i = F[ea]
+            i["proto"] = prototipo(ea, cf)
+            i["decompilado"], i["falha"] = True, None
+            caminho = os.path.join(SRC, FALHAS[ea]["arq"] + ".c")
+            with open(caminho, "w", encoding="utf-8", errors="replace") as f:
+                f.write(cabecalho_funcao(ea) + "\n" + INCLUDES + "\n/* recuperada no retry (funcao reanalisada) */\n" + corpo + "\n")
+            with open(os.path.join(OUT, "pseudocode_hexrays.c"), "a", encoding="utf-8", errors="replace") as f:
+                f.write("\n" + "=" * 100 + f"\n// EA: 0x{ea:016X}  (recuperada no retry)\n// NAME: {i['name']}\n"
+                        + "=" * 100 + "\n" + corpo + "\n")
+            try:
+                os.remove(os.path.join(ASMDIR, FALHAS[ea]["arq"] + ".asm"))
+            except OSError:
+                pass
+            recuperadas.append(ea)
+            del FALHAS[ea]
+
+    exportadas = {e for e, i in F.items() if i["exported"]}
+    linhas, cont = [], collections.Counter()
+    for ea, info in FALHAS.items():
+        i = F[ea]
+        cat, sug = ac.categoria_falha(info["motivo"])
+        dep = ac.dependentes({k: v["callers"] for k, v in F.items()}, ea)
+        afet = len((dep | {ea}) & exportadas)
+        info.update({"categoria": cat, "sugestao": sug, "diretos": len(i["callers"]),
+                     "dependentes": len(dep), "exports_afetados": afet})
+        cont[cat] += 1
+        if not info["motivo"].startswith("prazo"):      # prazo: sem .c com asm; novo run resolve
+            ex = exemplos_de_chamada(ea)
+            try:
+                asm = open(os.path.join(ASMDIR, info["arq"] + ".asm"), encoding="utf-8", errors="replace").read()
+            except OSError:
+                asm = ""
+            corpo = ["\n/* FALHA NO DECOMPILADOR",
+                     f"   Motivo    : {info['motivo']}",
+                     f"   Categoria : {cat}",
+                     f"   Sugestao  : {sug}",
+                     f"   Impacto   : {info['diretos']} chamador(es) direto(s); {info['dependentes']} funcao(oes) dependente(s); "
+                     f"{afet} export(s) afetado(s)"]
+            if ex:
+                corpo.append("   Exemplos de chamada (nos chamadores decompilados) - use para inferir os argumentos:")
+                corpo += [f"     {l.replace('*/', '* /')}" for l in ex]
+            corpo.append("   Disassembly anotado (tambem em asm\\%s.asm):" % info["arq"])
+            caminho = os.path.join(SRC, info["arq"] + ".c")
+            with open(caminho, "w", encoding="utf-8", errors="replace") as f:
+                f.write(cabecalho_funcao(ea) + "\n" + INCLUDES + "\n".join(corpo) + "\n" + asm.replace("*/", "* /") + "*/\n")
+        linhas.append([ea, i, info])
+    # priorizacao: exportadas e de maior impacto primeiro; a mesma prioridade -> menores primeiro
+    linhas.sort(key=lambda t: (not t[1]["exported"], -t[2]["exports_afetados"], -t[2]["dependentes"], t[1]["size"]))
+    ac.gravar_csv(os.path.join(OUT, "falhas_priorizadas.csv"),
+                  ["prioridade", "ea", "nome", "tipo", "tamanho", "blocos", "categoria", "exportada",
+                   "chamadores_diretos", "dependentes", "exports_afetados", "motivo", "sugestao", "arquivo"],
+                  [[n, f"0x{ea:X}", i["name"], i["kind"], i["size"], i["nblocks"], inf["categoria"],
+                    "sim" if i["exported"] else "", inf["diretos"], inf["dependentes"], inf["exports_afetados"],
+                    inf["motivo"], inf["sugestao"], i["arquivo"]] for n, (ea, i, inf) in enumerate(linhas, 1)])
+    ac.gravar_csv(os.path.join(OUT, "decompile_failures.csv"),
+                  ["ea", "nome", "tipo", "tamanho", "blocos", "categoria", "motivo"],
+                  [[f"0x{ea:X}", i["name"], i["kind"], i["size"], i["nblocks"], inf["categoria"], inf["motivo"]]
+                   for ea, i, inf in sorted(linhas, key=lambda t: t[0])])
+    resumo_txt = ["FALHAS DO DECOMPILADOR POR CATEGORIA (final, apos retry)", "=" * 60,
+                  f"Recuperadas no retry: {len(recuperadas)}   Ainda falhando: {len(FALHAS)}", ""]
+    for cat, n in cont.most_common():
+        resumo_txt.append(f"{n:5d}  {cat}: {ac.categoria_falha('', cat)[1]}")
+    write("falhas_resumo.txt", "\n".join(resumo_txt) + "\n")
+    nbad = sum(1 for v in FALHAS.values() if not v["motivo"].startswith("prazo"))
+    STATUS.update({"recuperadas_retry": len(recuperadas), "falhas_por_categoria": dict(cont),
+                   "falhas_decompilador": nbad, "decompiladas": STATUS.get("decompiladas", 0) + len(recuperadas)})
 
 
 def escrever_funcoes_h(ordem):
@@ -1034,6 +1237,8 @@ def resumo():
         "hexrays": STATUS.get("hexrays"),
         "decompiladas": STATUS.get("decompiladas", 0),
         "falhas_decompilador": STATUS.get("falhas_decompilador", 0),
+        "recuperadas_retry": STATUS.get("recuperadas_retry", 0),
+        "falhas_por_categoria": STATUS.get("falhas_por_categoria", {}),
         "puladas_prazo": STATUS.get("puladas_prazo", 0),
         "classes_rtti": STATUS.get("classes_rtti", 0),
         "tabelas_candidatas": STATUS.get("tabelas_candidatas", 0),
@@ -1077,6 +1282,7 @@ def main():
         fase("grafo_saida", escrever_grafo, ordem)
         fase("tipos", tipos_locais)
         fase("decompilar", decompilar, ordem)
+        fase("tratar_falhas", tratar_falhas)
         fase("funcoes_h", escrever_funcoes_h, ordem)
         fase("exports_proto", exports_com_prototipos)
         fase("functions_txt", txt_functions)
